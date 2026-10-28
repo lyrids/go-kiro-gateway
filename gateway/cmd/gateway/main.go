@@ -74,47 +74,50 @@ func run() error {
 		authMgr = &noopAuthManager{region: cfg.Region}
 	}
 
-	// 4. Initialize model cache and load models from Kiro API.
-	modelCache := cache.New(cfg.ModelCacheTTL)
-	loadModelsAtStartup(cfg, authMgr, modelCache)
-
-	// Add hidden models to cache.
-	for displayName, internalID := range cfg.HiddenModels {
-		modelCache.AddHiddenModel(displayName, internalID)
-	}
-
-	// 5. Initialize model resolver.
-	modelResolver := resolver.New(modelCache, resolver.Config{
-		HiddenModels:   cfg.HiddenModels,
-		Aliases:        cfg.ModelAliases,
-		HiddenFromList: cfg.HiddenFromList,
-	})
-
-	// 6. Initialize HTTP client.
+	// 4. Initialize HTTP client.
 	kiroClient := client.NewKiroClient(authMgr, cfg)
 
-	// 7. Initialize debug logger.
-	debugLogger := debug.NewDebugLogger(cfg.DebugMode, cfg.DebugDir)
-
-	// 4b. Log the startup model fetch for debug visibility.
-	logStartupModels(debugLogger, modelCache)
-
-	// 8. Initialize truncation state.
-	truncState := truncation.NewState()
-
-	// 9. Select and initialize backend.
+	// 5. Select and initialize backend. This runs before model loading so
+	// ACP mode can read the model list from kiro-cli.
 	var b backend.Backend
+	var acpModels modelLister
 	if cfg.BackendMode == "acp" {
 		acpBackend, err := backend.NewACPBackend(cfg)
 		if err != nil {
 			return fmt.Errorf("acp backend: %w", err)
 		}
 		b = acpBackend
+		acpModels = acpBackend
 	} else {
 		b = backend.NewHTTPBackend(kiroClient)
 		log.Info().Msg("Backend: HTTP (Kiro API)")
 	}
 	defer b.Close()
+
+	// 6. Initialize model cache and load models (Kiro API or kiro-cli).
+	modelCache := cache.New(cfg.ModelCacheTTL)
+	loadModelsAtStartup(cfg, authMgr, acpModels, modelCache)
+
+	// Add hidden models to cache.
+	for displayName, internalID := range cfg.HiddenModels {
+		modelCache.AddHiddenModel(displayName, internalID)
+	}
+
+	// 7. Initialize model resolver.
+	modelResolver := resolver.New(modelCache, resolver.Config{
+		HiddenModels:   cfg.HiddenModels,
+		Aliases:        cfg.ModelAliases,
+		HiddenFromList: cfg.HiddenFromList,
+	})
+
+	// 8. Initialize debug logger.
+	debugLogger := debug.NewDebugLogger(cfg.DebugMode, cfg.DebugDir)
+
+	// 8b. Log the startup model fetch for debug visibility.
+	logStartupModels(debugLogger, modelCache)
+
+	// 9. Initialize truncation state.
+	truncState := truncation.NewState()
 
 	// 10. Create server with all dependencies.
 	srv := server.New(cfg, authMgr, modelCache, modelResolver, b, debugLogger, truncState)
@@ -129,8 +132,14 @@ func run() error {
 // loadModelsAtStartup attempts to load models from the Kiro
 // ListAvailableModels API. On failure it falls back to the hardcoded
 // fallback model list from config, logging enough detail for operators
-// to diagnose the failure.
-func loadModelsAtStartup(cfg *config.Config, authMgr auth.AuthManager, modelCache cache.ModelCache) {
+// to diagnose the failure. In ACP mode there are no Kiro API credentials,
+// so models come from kiro-cli (acpModels) instead.
+func loadModelsAtStartup(cfg *config.Config, authMgr auth.AuthManager, acpModels modelLister, modelCache cache.ModelCache) {
+	if cfg.BackendMode == "acp" {
+		loadModelsFromACP(cfg, acpModels, modelCache)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -139,23 +148,7 @@ func loadModelsAtStartup(cfg *config.Config, authMgr auth.AuthManager, modelCach
 	modelList, err := fetchModelsFromKiro(ctx, cfg, authMgr)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to load models from Kiro API, using fallback list")
-
-		fallbackIDs := make([]string, 0, len(cfg.FallbackModels))
-		fallback := make([]models.ModelInfo, 0, len(cfg.FallbackModels))
-		for _, fm := range cfg.FallbackModels {
-			fallback = append(fallback, models.ModelInfo{
-				ModelID:        fm.ModelID,
-				MaxInputTokens: cfg.DefaultMaxInputTokens,
-				DisplayName:    fm.ModelID,
-			})
-			fallbackIDs = append(fallbackIDs, fm.ModelID)
-		}
-		modelCache.Update(fallback)
-
-		log.Info().
-			Int("count", len(fallback)).
-			Strs("models", fallbackIDs).
-			Msg("Loaded fallback models")
+		loadFallbackModels(cfg, modelCache)
 		return
 	}
 
@@ -169,6 +162,82 @@ func loadModelsAtStartup(cfg *config.Config, authMgr auth.AuthManager, modelCach
 		Int("count", len(modelList)).
 		Strs("models", loadedIDs).
 		Msg("Loaded models from Kiro API")
+}
+
+// modelLister is the part of the ACP backend used for startup model loading.
+type modelLister interface {
+	ListModels(ctx context.Context) ([]backend.AvailableModel, error)
+}
+
+// loadModelsFromACP loads the model list from `kiro-cli chat --list-models`.
+// Each model's context window becomes its max input tokens, falling back to
+// DefaultMaxInputTokens when kiro-cli reports none. On error or an empty list
+// it falls back to the config list.
+func loadModelsFromACP(cfg *config.Config, acpModels modelLister, modelCache cache.ModelCache) {
+	if acpModels == nil {
+		loadFallbackModels(cfg, modelCache)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	available, err := acpModels.ListModels(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to load models from kiro-cli, using fallback list")
+		loadFallbackModels(cfg, modelCache)
+		return
+	}
+	if len(available) == 0 {
+		log.Warn().Msg("kiro-cli reported no models, using fallback list")
+		loadFallbackModels(cfg, modelCache)
+		return
+	}
+
+	modelList := make([]models.ModelInfo, 0, len(available))
+	loadedIDs := make([]string, 0, len(available))
+	for _, m := range available {
+		if m.ModelID == "" {
+			continue
+		}
+		maxInput := m.ContextWindowTokens
+		if maxInput <= 0 {
+			maxInput = cfg.DefaultMaxInputTokens
+		}
+		modelList = append(modelList, models.ModelInfo{
+			ModelID:        m.ModelID,
+			MaxInputTokens: maxInput,
+			DisplayName:    m.ModelID,
+		})
+		loadedIDs = append(loadedIDs, m.ModelID)
+	}
+	modelCache.Update(modelList)
+
+	log.Info().
+		Int("count", len(modelList)).
+		Strs("models", loadedIDs).
+		Msg("Loaded models from kiro-cli")
+}
+
+// loadFallbackModels populates the cache with the hardcoded fallback list
+// from config.
+func loadFallbackModels(cfg *config.Config, modelCache cache.ModelCache) {
+	fallbackIDs := make([]string, 0, len(cfg.FallbackModels))
+	fallback := make([]models.ModelInfo, 0, len(cfg.FallbackModels))
+	for _, fm := range cfg.FallbackModels {
+		fallback = append(fallback, models.ModelInfo{
+			ModelID:        fm.ModelID,
+			MaxInputTokens: cfg.DefaultMaxInputTokens,
+			DisplayName:    fm.ModelID,
+		})
+		fallbackIDs = append(fallbackIDs, fm.ModelID)
+	}
+	modelCache.Update(fallback)
+
+	log.Info().
+		Int("count", len(fallback)).
+		Strs("models", fallbackIDs).
+		Msg("Loaded fallback models")
 }
 
 // fetchModelsFromKiro calls the Kiro ListAvailableModels API and returns

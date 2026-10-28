@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -39,18 +40,48 @@ func (s *Server) handleListModels(w http.ResponseWriter, _ *http.Request) {
 
 	data := make([]map[string]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
-		data = append(data, map[string]any{
+		entry := map[string]any{
 			"id":       id,
 			"object":   "model",
 			"created":  time.Now().Unix(),
-			"owned_by": "anthropic",
-		})
+			"owned_by": modelOwner(id),
+		}
+		if info := s.cache.Get(id); info != nil {
+			if info.DisplayName != "" {
+				entry["name"] = info.DisplayName
+			}
+			if info.MaxInputTokens > 0 {
+				entry["context_window"] = info.MaxInputTokens
+			}
+		}
+		data = append(data, entry)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   data,
 	})
+}
+
+// modelOwner maps a model ID to its provider for the owned_by field.
+// Kiro serves non-Anthropic models (GPT, DeepSeek, ...), so a hardcoded
+// "anthropic" is wrong for them.
+func modelOwner(id string) string {
+	l := strings.ToLower(id)
+	switch {
+	case strings.HasPrefix(l, "gpt"):
+		return "openai"
+	case strings.HasPrefix(l, "deepseek"):
+		return "deepseek"
+	case strings.HasPrefix(l, "minimax"):
+		return "minimax"
+	case strings.HasPrefix(l, "glm"):
+		return "zhipu"
+	case strings.HasPrefix(l, "qwen"):
+		return "alibaba"
+	default:
+		return "anthropic"
+	}
 }
 
 // ---------------------------------------------------------------------------

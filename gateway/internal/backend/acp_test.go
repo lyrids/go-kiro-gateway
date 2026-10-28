@@ -5,11 +5,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +43,23 @@ func TestFakeKiroCLI(t *testing.T) {
 // streams two text chunks and ends the turn cleanly.
 func fakeKiroCLIMain() {
 	mode := os.Getenv("FAKE_KIRO_MODE")
+
+	// One-shot `chat --list-models --format json` invocation.
+	if slices.Contains(flag.Args(), "--list-models") {
+		switch mode {
+		case "list_models_fail":
+			fmt.Fprintln(os.Stderr, "not logged in")
+			os.Exit(1)
+		case "list_models_garbage":
+			fmt.Println("not json")
+		default:
+			fmt.Println(`{"models":[` +
+				`{"model_id":"auto","model_name":"auto","context_window_tokens":1000000},` +
+				`{"model_id":"claude-sonnet-4.5","model_name":"claude-sonnet-4.5","context_window_tokens":200000}` +
+				`],"default_model":"auto"}`)
+		}
+		os.Exit(0)
+	}
 
 	// Append handled events to FAKE_KIRO_LOG so tests can observe how many
 	// sessions were created and which slash commands were issued.
@@ -248,11 +267,16 @@ func startFakeACPBackendOpts(t *testing.T, mode string, maxIdle int) (*ACPBacken
 		t.Fatalf("cmd.Start: %v", err)
 	}
 
+	// cliPrefix ends with "--" so the test flag parser leaves the kiro-cli
+	// args for flag.Args() in the fake.
 	b := &ACPBackend{
 		cmd:         cmd,
 		stdin:       stdin,
 		stdout:      bufio.NewReader(stdoutPipe),
 		cfg:         cfg,
+		cliPath:     testBin,
+		cliPrefix:   append(append([]string{}, args...), "--"),
+		cliEnv:      []string{"FAKE_KIRO_CLI=1", "FAKE_KIRO_MODE=" + mode, "FAKE_KIRO_LOG=" + logPath},
 		idleByModel: make(map[string][]string),
 		maxIdle:     cfg.ACPMaxIdleSessions,
 		done:        make(chan struct{}),
@@ -555,6 +579,45 @@ func TestACPBackend_ReusesPooledSession(t *testing.T) {
 	}
 	if n := countLog(t, logPath, "prompt:/clear"); n != 1 {
 		t.Errorf("/clear count = %d, want 1 (issued on reuse)", n)
+	}
+}
+
+func TestACPBackend_ListModels(t *testing.T) {
+	b, logPath, err := startFakeACPBackendOpts(t, "", 4)
+	if err != nil {
+		t.Fatalf("startup error: %v", err)
+	}
+	defer b.Close()
+
+	got, err := b.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(got) != 2 || got[0].ModelID != "auto" || got[1].ModelID != "claude-sonnet-4.5" {
+		t.Fatalf("models = %+v", got)
+	}
+	if got[1].ContextWindowTokens != 200000 {
+		t.Errorf("context window = %d, want 200000", got[1].ContextWindowTokens)
+	}
+	// Listing runs as a separate process and must not create ACP sessions.
+	if n := countLog(t, logPath, "session/new"); n != 0 {
+		t.Errorf("session/new count = %d, want 0", n)
+	}
+}
+
+func TestACPBackend_ListModels_Errors(t *testing.T) {
+	for _, mode := range []string{"list_models_fail", "list_models_garbage"} {
+		t.Run(mode, func(t *testing.T) {
+			b, _, err := startFakeACPBackendOpts(t, mode, 0)
+			if err != nil {
+				t.Fatalf("startup error: %v", err)
+			}
+			defer b.Close()
+
+			if _, err := b.ListModels(context.Background()); err == nil {
+				t.Fatal("expected error")
+			}
+		})
 	}
 }
 

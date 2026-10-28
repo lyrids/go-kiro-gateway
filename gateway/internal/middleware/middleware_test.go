@@ -1,10 +1,16 @@
 package middleware_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/chasedputnam/go-kiro-gateway/gateway/internal/middleware"
 )
@@ -271,4 +277,106 @@ func TestAuth_MalformedBearerToken(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for malformed Bearer token, got %d", rr.Code)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// RequestLogger middleware tests
+// ---------------------------------------------------------------------------
+
+// captureLog redirects the global zerolog logger into a buffer for the test
+// and returns a func that decodes the single logged entry.
+func captureLog(t *testing.T) func() map[string]any {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := log.Logger
+	log.Logger = zerolog.New(&buf)
+	t.Cleanup(func() { log.Logger = orig })
+	return func() map[string]any {
+		var entry map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+			t.Fatalf("decode log entry %q: %v", buf.String(), err)
+		}
+		return entry
+	}
+}
+
+func TestRequestLogger_POST_LogsBodySizes(t *testing.T) {
+	entry := captureLog(t)
+	handler := middleware.RequestLogger()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+
+	reqBody := `{"model":"auto","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	e := entry()
+	if e["method"] != "POST" || e["path"] != "/v1/chat/completions" {
+		t.Errorf("method/path = %v %v", e["method"], e["path"])
+	}
+	if got := e["request_bytes"]; got != float64(len(reqBody)) {
+		t.Errorf("request_bytes = %v, want %d", got, len(reqBody))
+	}
+	if got := e["content_length"]; got != float64(len(reqBody)) {
+		t.Errorf("content_length = %v, want %d", got, len(reqBody))
+	}
+	if got := e["response_bytes"]; got != float64(len(`{"ok":true}`)) {
+		t.Errorf("response_bytes = %v, want %d", got, len(`{"ok":true}`))
+	}
+	if e["status"] != float64(http.StatusOK) {
+		t.Errorf("status = %v, want 200", e["status"])
+	}
+}
+
+func TestRequestLogger_GET_LogsZeroRequestBytes(t *testing.T) {
+	entry := captureLog(t)
+	handler := middleware.RequestLogger()(dummyHandler())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	e := entry()
+	if e["method"] != "GET" {
+		t.Errorf("method = %v, want GET", e["method"])
+	}
+	if e["request_bytes"] != float64(0) {
+		t.Errorf("request_bytes = %v, want 0", e["request_bytes"])
+	}
+	if e["response_bytes"] != float64(len(`{"ok":true}`)) {
+		t.Errorf("response_bytes = %v", e["response_bytes"])
+	}
+}
+
+func TestRequestLogger_ChunkedBodyCountsBytesRead(t *testing.T) {
+	entry := captureLog(t)
+	handler := middleware.RequestLogger()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("hello"))
+	req.ContentLength = -1 // as for a chunked upload
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	e := entry()
+	if e["request_bytes"] != float64(5) {
+		t.Errorf("request_bytes = %v, want 5", e["request_bytes"])
+	}
+	if e["content_length"] != float64(-1) {
+		t.Errorf("content_length = %v, want -1", e["content_length"])
+	}
+	if e["status"] != float64(http.StatusAccepted) {
+		t.Errorf("status = %v, want 202", e["status"])
+	}
+}
+
+func TestRequestLogger_PreservesFlusher(t *testing.T) {
+	_ = captureLog(t)
+	handler := middleware.RequestLogger()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(http.Flusher); !ok {
+			t.Error("wrapped writer does not implement http.Flusher")
+		}
+	}))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 }

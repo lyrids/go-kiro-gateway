@@ -38,10 +38,16 @@ type ACPBackend struct {
 	cfg    *config.Config
 	logger zerolog.Logger
 
-	mu      sync.Mutex              // serialises JSON-RPC writes
-	nextID  atomic.Int64            // monotonically increasing request IDs
-	pending sync.Map                // int64 → chan *rpcMessage (in-flight requests)
-	notifs  sync.Map                // string (sessionID) → chan *SessionNotification
+	// kiro-cli invocation for one-shot commands (e.g. --list-models). Tests
+	// point these at the fake CLI via a leading arg prefix and extra env.
+	cliPath   string
+	cliPrefix []string
+	cliEnv    []string
+
+	mu      sync.Mutex   // serialises JSON-RPC writes
+	nextID  atomic.Int64 // monotonically increasing request IDs
+	pending sync.Map     // int64 → chan *rpcMessage (in-flight requests)
+	notifs  sync.Map     // string (sessionID) → chan *SessionNotification
 
 	poolMu      sync.Mutex          // guards idleByModel
 	idleByModel map[string][]string // kiro model id ("" = default) → idle session IDs
@@ -87,6 +93,7 @@ func NewACPBackend(cfg *config.Config) (*ACPBackend, error) {
 		stdin:       stdin,
 		stdout:      bufio.NewReader(stdoutPipe),
 		cfg:         cfg,
+		cliPath:     cliPath,
 		logger:      log.With().Str("component", "acp").Logger(),
 		idleByModel: make(map[string][]string),
 		maxIdle:     cfg.ACPMaxIdleSessions,
@@ -350,6 +357,33 @@ func (b *ACPBackend) sessionNew(ctx context.Context) (string, error) {
 	return r.SessionID, nil
 }
 
+// cliCommand builds a one-shot kiro-cli invocation with the given arguments.
+func (b *ACPBackend) cliCommand(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, b.cliPath, append(append([]string{}, b.cliPrefix...), args...)...)
+	if len(b.cliEnv) > 0 {
+		cmd.Env = append(os.Environ(), b.cliEnv...)
+	}
+	return cmd
+}
+
+// ListModels runs `kiro-cli chat --list-models --format json` and returns the
+// models it reports. This is a separate short-lived process, not the ACP
+// subprocess, so it does not touch the session pool.
+func (b *ACPBackend) ListModels(ctx context.Context) ([]AvailableModel, error) {
+	cmd := b.cliCommand(ctx, "chat", "--list-models", "--format", "json")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("acp: kiro-cli --list-models: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	var r ListModelsResponse
+	if err := json.Unmarshal(out, &r); err != nil {
+		return nil, fmt.Errorf("acp: parse kiro-cli --list-models output: %w", err)
+	}
+	return r.Models, nil
+}
+
 // checkoutSession returns a session ready for a fresh turn for the given model
 // key, reusing a cleared idle pooled session when one is available or creating a
 // new one otherwise. The returned poolKey is the model the session actually has
@@ -490,7 +524,9 @@ func (b *ACPBackend) runCommandTurn(ctx context.Context, sessionID, text string)
 func toKiroModelID(model string) string {
 	parts := strings.Split(model, "-")
 	n := len(parts)
-	if n >= 2 && isAllDigits(parts[n-1]) && isAllDigits(parts[n-2]) {
+	// The minor version is 1-2 digits; longer numeric tails are date stamps
+	// (e.g. claude-sonnet-4-20250514) and must not be rewritten.
+	if n >= 2 && len(parts[n-1]) <= 2 && isAllDigits(parts[n-1]) && isAllDigits(parts[n-2]) {
 		return strings.Join(parts[:n-1], "-") + "." + parts[n-1]
 	}
 	return model

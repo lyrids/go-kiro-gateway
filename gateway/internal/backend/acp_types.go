@@ -58,6 +58,21 @@ type SessionNotification struct {
 	Update    json.RawMessage `json:"update"`
 }
 
+// AvailableModel is one entry of `kiro-cli chat --list-models --format json`.
+// kiro-cli reports model IDs in its dot form (e.g. "claude-sonnet-4.5").
+type AvailableModel struct {
+	ModelID             string `json:"model_id"`
+	ModelName           string `json:"model_name"`
+	Description         string `json:"description,omitempty"`
+	ContextWindowTokens int    `json:"context_window_tokens"`
+}
+
+// ListModelsResponse is the JSON output of `kiro-cli chat --list-models`.
+type ListModelsResponse struct {
+	Models       []AvailableModel `json:"models"`
+	DefaultModel string           `json:"default_model"`
+}
+
 // PromptResponse is the result of a session/prompt request. Its stopReason —
 // not a notification — is the turn-completion signal in ACP.
 type PromptResponse struct {

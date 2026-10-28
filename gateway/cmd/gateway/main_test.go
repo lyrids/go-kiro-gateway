@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -208,7 +209,7 @@ func TestLoadModelsAtStartup_Fallback(t *testing.T) {
 	}
 
 	modelCache := cache.New(time.Hour)
-	loadModelsAtStartup(cfg, authMgr, modelCache)
+	loadModelsAtStartup(cfg, authMgr, nil, modelCache)
 
 	ids := modelCache.GetAllModelIDs()
 	if len(ids) != 3 {
@@ -219,6 +220,99 @@ func TestLoadModelsAtStartup_Fallback(t *testing.T) {
 	}
 	if !modelCache.IsValidModel("claude-sonnet-4") {
 		t.Error("expected 'claude-sonnet-4' in cache")
+	}
+}
+
+func TestLoadModelsAtStartup_ACPSkipsFetch(t *testing.T) {
+	called := false
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = w.Write([]byte(`{"models": [{"modelId": "from-api"}]}`))
+	}))
+	defer apiServer.Close()
+
+	cfg := testConfig()
+	cfg.BackendMode = "acp"
+	cfg.FallbackModels = []config.FallbackModel{{ModelID: "auto"}, {ModelID: "claude-sonnet-4"}}
+
+	authMgr := &mockAuthManager{qHost: apiServer.URL}
+
+	modelCache := cache.New(time.Hour)
+	loadModelsAtStartup(cfg, authMgr, nil, modelCache)
+
+	if called {
+		t.Error("expected no Kiro API request in ACP mode")
+	}
+	if ids := modelCache.GetAllModelIDs(); len(ids) != 2 {
+		t.Fatalf("expected 2 fallback models, got %d: %v", len(ids), ids)
+	}
+	if modelCache.IsValidModel("from-api") {
+		t.Error("did not expect API model in cache")
+	}
+}
+
+// fakeModelLister stands in for the ACP backend's ListModels.
+type fakeModelLister struct {
+	models []backendpkg.AvailableModel
+	err    error
+}
+
+func (f *fakeModelLister) ListModels(_ context.Context) ([]backendpkg.AvailableModel, error) {
+	return f.models, f.err
+}
+
+func TestLoadModelsAtStartup_ACPUsesKiroCLIModels(t *testing.T) {
+	cfg := testConfig()
+	cfg.BackendMode = "acp"
+	cfg.FallbackModels = []config.FallbackModel{{ModelID: "fallback-only"}}
+
+	lister := &fakeModelLister{models: []backendpkg.AvailableModel{
+		{ModelID: "auto"}, // no context window → default
+		{ModelID: "claude-sonnet-4.5", ContextWindowTokens: 200000},
+		{ModelID: ""}, // skipped
+	}}
+
+	modelCache := cache.New(time.Hour)
+	loadModelsAtStartup(cfg, newMockAuth(), lister, modelCache)
+
+	if ids := modelCache.GetAllModelIDs(); len(ids) != 2 {
+		t.Fatalf("expected 2 kiro-cli models, got %d: %v", len(ids), ids)
+	}
+	if !modelCache.IsValidModel("claude-sonnet-4.5") {
+		t.Error("expected 'claude-sonnet-4.5' in cache")
+	}
+	if modelCache.IsValidModel("fallback-only") {
+		t.Error("did not expect fallback model in cache")
+	}
+	if got := modelCache.GetMaxInputTokens("claude-sonnet-4.5"); got != 200000 {
+		t.Errorf("max input tokens = %d, want 200000", got)
+	}
+	if got := modelCache.GetMaxInputTokens("auto"); got != cfg.DefaultMaxInputTokens {
+		t.Errorf("auto max input tokens = %d, want default %d", got, cfg.DefaultMaxInputTokens)
+	}
+}
+
+func TestLoadModelsAtStartup_ACPFallsBack(t *testing.T) {
+	tests := []struct {
+		name   string
+		lister *fakeModelLister
+	}{
+		{"error", &fakeModelLister{err: errors.New("session/new failed")}},
+		{"empty", &fakeModelLister{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.BackendMode = "acp"
+			cfg.FallbackModels = []config.FallbackModel{{ModelID: "auto"}, {ModelID: "claude-sonnet-4"}}
+
+			modelCache := cache.New(time.Hour)
+			loadModelsAtStartup(cfg, newMockAuth(), tt.lister, modelCache)
+
+			if ids := modelCache.GetAllModelIDs(); len(ids) != 2 {
+				t.Fatalf("expected 2 fallback models, got %d: %v", len(ids), ids)
+			}
+		})
 	}
 }
 
@@ -245,7 +339,7 @@ func TestLoadModelsAtStartup_APISuccess(t *testing.T) {
 	}
 
 	modelCache := cache.New(time.Hour)
-	loadModelsAtStartup(cfg, authMgr, modelCache)
+	loadModelsAtStartup(cfg, authMgr, nil, modelCache)
 
 	ids := modelCache.GetAllModelIDs()
 	if len(ids) != 2 {
@@ -271,7 +365,7 @@ func TestLoadModelsAtStartup_HiddenModels(t *testing.T) {
 	}
 
 	modelCache := cache.New(time.Hour)
-	loadModelsAtStartup(cfg, authMgr, modelCache)
+	loadModelsAtStartup(cfg, authMgr, nil, modelCache)
 
 	for displayName, internalID := range cfg.HiddenModels {
 		modelCache.AddHiddenModel(displayName, internalID)

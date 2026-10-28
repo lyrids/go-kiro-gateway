@@ -107,7 +107,10 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 func (s *Server) buildRouter() chi.Router {
 	r := chi.NewRouter()
 
-	// Global middleware stack: CORS → Auth → Debug.
+	// Global middleware stack: RequestLogger → CORS → Auth → Debug.
+	// RequestLogger is outermost so rejected (401, preflight) requests are
+	// logged too, and it sees the body bytes the debug middleware reads.
+	r.Use(middleware.RequestLogger())
 	r.Use(middleware.CORS())
 	r.Use(middleware.Auth(s.config.ProxyAPIKey))
 	r.Use(debug.Middleware(s.debugLogger))
